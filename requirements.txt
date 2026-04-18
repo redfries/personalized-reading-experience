@@ -1,0 +1,5 @@
+gradio
+sentence-transformers
+torch
+PyMuPDF
+numpy
