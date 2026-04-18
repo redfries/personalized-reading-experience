@@ -11,27 +11,49 @@ import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer, util
 
-# Portable project paths
+# Repo paths
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-CACHE_DIR = DATA_DIR / "cache"
-LOGS_DIR = DATA_DIR / "logs"
-PROFILE_PATH = DATA_DIR / "topic_profile.txt"
+
+# Runtime-writable paths for Hugging Face Spaces
+RUNTIME_DIR = Path(os.environ.get("APP_RUNTIME_DIR", "/tmp/personalized_reading_runtime"))
+CACHE_DIR = RUNTIME_DIR / "cache"
+LOGS_DIR = RUNTIME_DIR / "logs"
+HF_CACHE_DIR = RUNTIME_DIR / "hf_cache"
 APP_RUNS_FILE = LOGS_DIR / "app_runs.csv"
 
-for d in [DATA_DIR, CACHE_DIR, LOGS_DIR]:
+for d in [RUNTIME_DIR, CACHE_DIR, LOGS_DIR, HF_CACHE_DIR]:
     d.mkdir(parents=True, exist_ok=True)
+
+os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
+os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_CACHE_DIR))
+os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", str(HF_CACHE_DIR))
+
+# Read profile text from either root or data/ if available
+PROFILE_CANDIDATES = [
+    BASE_DIR / "topic_profile.txt",
+    BASE_DIR / "data" / "topic_profile.txt",
+]
+PROFILE_PATH = next((p for p in PROFILE_CANDIDATES if p.exists()), None)
 
 DEFAULT_PROFILE = (
     PROFILE_PATH.read_text(encoding="utf-8").strip()
-    if PROFILE_PATH.exists()
+    if PROFILE_PATH is not None
     else "Describe your research interests here. Example: AI tools for reading scientific papers, personalized highlighting, human-computer interaction, and reading support systems."
 )
 
 MODEL_NAME = "all-MiniLM-L6-v2"
-DEVICE = "cpu"  # safest for first deployment
-model = SentenceTransformer(MODEL_NAME, device=DEVICE)
+DEVICE = "cpu"
 OFF_PROFILE_LIMIT = 0.40
+model = None
+
+
+def get_model():
+    global model
+    if model is None:
+        print("Loading sentence-transformer model...", flush=True)
+        model = SentenceTransformer(MODEL_NAME, device=DEVICE)
+        print("Sentence-transformer model loaded.", flush=True)
+    return model
 
 
 def compute_doc_hash(file_bytes: bytes) -> str:
@@ -118,273 +140,188 @@ def is_probable_section_title(s: str) -> bool:
 
 
 def simple_sentence_split(text: str):
-    text = text.replace("\r", " ").replace("\n", " ")
     text = re.sub(r"\s+", " ", text)
     parts = re.split(r"(?<=[.!?])\s+", text)
     return [p.strip() for p in parts if p.strip()]
 
 
-def is_junk_sentence(s: str) -> bool:
-    num_words = len(s.split())
-    if num_words < 5 or num_words > 60:
-        return True
-
-    lower = s.lower().strip()
-    junk_markers = [
-        "doi",
-        "issn",
-        "copyright",
-        "creative commons",
-        "ieee access",
-        "http://",
-        "https://",
-        "arxiv:",
-    ]
-    if any(marker in lower for marker in junk_markers):
-        return True
-    if lower.startswith("[") and "]" in lower[:10]:
-        return True
-    if lower.startswith(("figure ", "fig. ", "table ")):
-        return True
-    if is_probable_section_title(s):
-        return True
-    return False
-
-
-def pdf_to_clean_sentences(pdf_file):
-    file_bytes, _ = extract_pdf_bytes_and_name(pdf_file)
-    if file_bytes is None:
-        return None, []
-
-    doc_hash = compute_doc_hash(file_bytes)
-    raw_text = extract_text_from_pdf_bytes(file_bytes)
-    if len(raw_text.strip()) < 100:
-        return doc_hash, []
-
-    text = strip_references_section(raw_text)
+def clean_sentences(text: str, min_words=5, max_words=60):
     raw_sentences = simple_sentence_split(text)
+    clean = []
+    for sent in raw_sentences:
+        num_words = len(sent.split())
+        lowered = sent.lower()
 
-    sentences = []
-    sid_counter = 1
-    for s in raw_sentences:
-        s = s.strip()
-        if not s or is_junk_sentence(s):
+        if num_words < min_words or num_words > max_words:
             continue
-        sid = f"s{sid_counter:03d}"
-        sentences.append((sid, s))
-        sid_counter += 1
-    return doc_hash, sentences
+        if re.match(r"^\[\d+\]", sent):
+            continue
+        if any(tok in lowered for tok in ["doi", "ieee access", "http://", "https://", "vol.", "volume "]):
+            continue
+        if is_probable_section_title(sent):
+            continue
+        if lowered.startswith(("figure ", "fig. ", "table ")):
+            continue
+
+        clean.append(sent)
+    return clean
 
 
-def get_sentences_and_embeddings(pdf_file):
-    file_bytes, _ = extract_pdf_bytes_and_name(pdf_file)
-    if file_bytes is None:
-        return None, [], None
-
-    doc_hash = compute_doc_hash(file_bytes)
-    if cache_exists(doc_hash):
-        sentences, embeddings = load_cache(doc_hash)
-        return doc_hash, sentences, embeddings
-
-    doc_hash, sentences = pdf_to_clean_sentences(pdf_file)
-    if doc_hash is None or not sentences:
-        return doc_hash, [], None
-
-    sentence_texts = [text for _, text in sentences]
-    embeddings = model.encode(sentence_texts, convert_to_tensor=True, device=DEVICE)
-    save_cache(doc_hash, sentences, embeddings)
-    return doc_hash, sentences, embeddings
+def make_sentence_table(sentences):
+    rows = []
+    for i, sent in enumerate(sentences, start=1):
+        rows.append((f"s{i:03d}", sent))
+    return rows
 
 
-def score_sentences_for_profile(sentences, embeddings, profile_text: str):
-    if not sentences or embeddings is None:
-        return np.array([])
-    profile_emb = model.encode(profile_text, convert_to_tensor=True, device=DEVICE)
-    scores = util.cos_sim(profile_emb, embeddings)[0]
-    return scores.detach().cpu().numpy()
+def score_sentences(profile_text: str, sentence_rows, sentence_embeddings: torch.Tensor | None = None):
+    active_model = get_model()
+    profile_emb = active_model.encode(profile_text, convert_to_tensor=True, device=DEVICE)
+    profile_emb = profile_emb.to(DEVICE)
+
+    if sentence_embeddings is None:
+        texts = [s for _, s in sentence_rows]
+        sentence_embeddings = active_model.encode(texts, convert_to_tensor=True, device=DEVICE)
+        sentence_embeddings = sentence_embeddings.to(DEVICE)
+
+    scores = util.cos_sim(profile_emb, sentence_embeddings)[0].detach().cpu().numpy()
+    records = []
+    for (sentence_id, sentence_text), score in zip(sentence_rows, scores):
+        records.append({
+            "sentence_id": sentence_id,
+            "sentence_text": sentence_text,
+            "score": float(score),
+        })
+    records.sort(key=lambda x: x["score"], reverse=True)
+    return records, sentence_embeddings
 
 
-def select_highlights(sentences, scores, top_k: int, threshold: float):
-    if len(sentences) == 0 or len(scores) == 0:
-        return "Error: no usable text found in this PDF.", []
+def select_highlights(df_sorted, top_k: int, threshold: float):
+    if not df_sorted:
+        return "No usable sentences found.", []
 
-    rows = [
-        {"sid": sid, "text": text, "score": float(score)}
-        for (sid, text), score in zip(sentences, scores)
-    ]
-    rows_sorted = sorted(rows, key=lambda x: x["score"], reverse=True)
+    total_sentences = len(df_sorted)
+    max_score = df_sorted[0]["score"]
+    num_above_threshold = sum(row["score"] >= threshold for row in df_sorted)
 
-    total_sentences = len(rows_sorted)
-    max_score = rows_sorted[0]["score"]
-    num_above_threshold = sum(1 for row in rows_sorted if row["score"] >= threshold)
-    mode = "off_profile" if max_score < OFF_PROFILE_LIMIT else "profile"
-
-    highlights = []
-    if mode == "profile":
-        filtered = [row for row in rows_sorted if row["score"] >= threshold]
-        used_threshold = bool(filtered)
-        selected = (filtered if filtered else rows_sorted)[:top_k]
-        summary_lines = [
-            "Mode: Profile match",
-            f"Total sentences: {total_sentences}",
-            f"Max similarity: {max_score:.3f}",
-            f"Threshold: {threshold:.2f}",
-            f"Sentences above threshold: {num_above_threshold}",
-            f"Sentences shown: {len(selected)}",
-        ]
-        if not used_threshold:
-            summary_lines.append("Note: threshold was too strict, so top results were shown instead.")
-        label = "Relevant"
-    else:
-        selected = rows_sorted[:top_k]
-        summary_lines = [
-            "Mode: Off profile",
-            f"Total sentences: {total_sentences}",
-            f"Max similarity: {max_score:.3f}",
-            f"Threshold is ignored in off-profile mode.",
-            f"Sentences shown: {len(selected)}",
-        ]
-        label = "Best guess"
-
-    for row in selected:
-        display_text = f"[{row['score']:.3f}] {row['text']}"
-        highlights.append((display_text, label))
-
-    return "\n".join(summary_lines), highlights
-
-
-def log_app_run(user_id: str, paper_name: str, mode: str, max_score: float, top_k: int, threshold: float, num_sentences: int, num_shown: int):
-    header = [
-        "timestamp_utc",
-        "user_id",
-        "paper_name",
-        "mode",
-        "max_score",
-        "top_k",
-        "threshold",
-        "num_sentences",
-        "num_shown",
-    ]
-    file_exists = APP_RUNS_FILE.exists()
-    with APP_RUNS_FILE.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(header)
-        writer.writerow([
-            datetime.now(timezone.utc).isoformat(),
-            user_id,
-            paper_name,
-            mode,
-            f"{max_score:.3f}",
-            top_k,
-            f"{threshold:.2f}",
-            num_sentences,
-            num_shown,
-        ])
-
-
-def run_analysis(pdf_file, profile_text, top_k, threshold, user_id):
-    if pdf_file is None:
-        return "Please upload a PDF.", []
-
-    profile_text = (profile_text or "").strip()
-    if not profile_text:
-        return "Please enter your profile text.", []
-
-    _, paper_name = extract_pdf_bytes_and_name(pdf_file)
-    if paper_name is None:
-        return "Could not read the uploaded PDF.", []
-
-    doc_hash, sentences, embeddings = get_sentences_and_embeddings(pdf_file)
-    if doc_hash is None or not sentences or embeddings is None:
-        return "No usable text was extracted from this PDF. It may be scanned, image-only, or too noisy.", []
-
-    scores = score_sentences_for_profile(sentences, embeddings, profile_text)
-    if len(scores) == 0:
-        return "Could not compute similarity scores.", []
-
-    summary, highlights = select_highlights(sentences, scores, int(top_k), float(threshold))
-
-    max_score = float(scores.max())
-    mode = "profile" if max_score >= OFF_PROFILE_LIMIT else "off_profile"
-    user_id_clean = (user_id or "anonymous").strip() or "anonymous"
-
-    try:
-        log_app_run(
-            user_id=user_id_clean,
-            paper_name=paper_name,
-            mode=mode,
-            max_score=max_score,
-            top_k=int(top_k),
-            threshold=float(threshold),
-            num_sentences=len(sentences),
-            num_shown=len(highlights),
+    if max_score < OFF_PROFILE_LIMIT:
+        mode = "off_profile"
+        selected = df_sorted[:top_k]
+        summary = (
+            f"Mode: Off profile (topic mismatch)\\n"
+            f"Total sentences: {total_sentences}\\n"
+            f"Max similarity: {max_score:.3f}\\n"
+            f"Threshold ignored in this mode\\n"
+            f"Showing top {len(selected)} best guesses"
         )
-    except Exception as exc:
-        print(f"Logging failed: {exc}")
+        highlights = [(f"[{row['score']:.3f}] {row['sentence_text']}", "Best guess") for row in selected]
+    else:
+        mode = "profile"
+        filtered = [row for row in df_sorted if row["score"] >= threshold]
+        if filtered:
+            selected = filtered[:top_k]
+            note = "Threshold applied successfully"
+        else:
+            selected = df_sorted[:top_k]
+            note = "No sentences met threshold, so top results were shown"
+        summary = (
+            f"Mode: Profile match\\n"
+            f"Total sentences: {total_sentences}\\n"
+            f"Max similarity: {max_score:.3f}\\n"
+            f"Sentences above threshold: {num_above_threshold}\\n"
+            f"Showing: {len(selected)}\\n"
+            f"{note}"
+        )
+        highlights = [(f"[{row['score']:.3f}] {row['sentence_text']}", "Relevant") for row in selected]
 
     return summary, highlights
 
 
-def create_app():
-    with gr.Blocks(title="Personalized Paper Highlighter") as demo:
-        gr.Markdown(
-            "# Personalized Reading Highlights\n"
-            "Upload a research paper PDF, enter your research profile, and view the most relevant sentences."
-        )
+def append_run_log(pdf_name: str, top_k: int, threshold: float, summary: str):
+    file_exists = APP_RUNS_FILE.exists()
+    with APP_RUNS_FILE.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["timestamp_utc", "pdf_name", "top_k", "threshold", "summary"])
+        writer.writerow([
+            datetime.now(timezone.utc).isoformat(),
+            pdf_name,
+            top_k,
+            threshold,
+            summary.replace("\n", " | "),
+        ])
+
+
+def analyze_pdf(profile_text, pdf_file, top_k, threshold):
+    if not pdf_file:
+        return "Please upload a PDF.", []
+    if not profile_text or not profile_text.strip():
+        return "Please enter your research profile text.", []
+
+    file_bytes, pdf_name = extract_pdf_bytes_and_name(pdf_file)
+    if not file_bytes:
+        return "Could not read the uploaded PDF.", []
+
+    doc_hash = compute_doc_hash(file_bytes)
+
+    if cache_exists(doc_hash):
+        sentence_rows, sentence_embeddings = load_cache(doc_hash)
+    else:
+        raw_text = extract_text_from_pdf_bytes(file_bytes)
+        if len(raw_text.strip()) < 50:
+            return "The PDF seems empty or scanned with no extractable text.", []
+        clean_text = strip_references_section(raw_text)
+        sentences = clean_sentences(clean_text)
+        if len(sentences) < 5:
+            return "The PDF did not yield enough usable text.", []
+        sentence_rows = make_sentence_table(sentences)
+        _, sentence_embeddings = score_sentences(profile_text, sentence_rows, sentence_embeddings=None)
+        save_cache(doc_hash, sentence_rows, sentence_embeddings)
+
+    df_sorted, _ = score_sentences(profile_text, sentence_rows, sentence_embeddings=sentence_embeddings)
+    summary, highlights = select_highlights(df_sorted, int(top_k), float(threshold))
+    append_run_log(pdf_name or "uploaded.pdf", int(top_k), float(threshold), summary)
+    return summary, highlights
+
+
+def build_demo():
+    with gr.Blocks(title="Personalized Reading Experience") as demo:
+        gr.Markdown("# Personalized Reading Experience")
+        gr.Markdown("Upload a paper, compare its sentences against your research profile, and see the most relevant highlights.")
 
         with gr.Row():
             with gr.Column(scale=1):
-                user_id = gr.Textbox(
-                    label="User ID for logs (optional)",
-                    value="u1",
-                    placeholder="u1, initials, or leave as default",
-                )
-                profile_box = gr.Textbox(
+                profile_input = gr.Textbox(
                     label="Research profile",
-                    value=DEFAULT_PROFILE,
                     lines=8,
+                    value=DEFAULT_PROFILE,
+                    placeholder="Describe your research interests here...",
                 )
-                pdf_input = gr.File(label="Upload a PDF", file_types=[".pdf"])
-                top_k_slider = gr.Slider(
-                    label="Number of sentences to show",
-                    minimum=5,
-                    maximum=50,
-                    step=1,
-                    value=15,
-                )
-                threshold_slider = gr.Slider(
-                    label="Similarity threshold",
-                    minimum=0.0,
-                    maximum=0.6,
-                    step=0.02,
-                    value=0.20,
-                )
-                analyze_btn = gr.Button("Analyze paper")
+                pdf_input = gr.File(label="Upload PDF", file_types=[".pdf"])
+                top_k_input = gr.Slider(1, 20, value=8, step=1, label="Top-K sentences")
+                threshold_input = gr.Slider(0.0, 1.0, value=0.50, step=0.01, label="Similarity threshold")
+                run_button = gr.Button("Analyze paper")
 
             with gr.Column(scale=1):
-                summary_out = gr.Textbox(label="Summary", lines=8)
-                highlight_out = gr.HighlightedText(
+                summary_output = gr.Textbox(label="Summary", lines=7)
+                highlights_output = gr.HighlightedText(
                     label="Highlighted sentences",
-                    combine_adjacent=True,
-                    color_map={"Relevant": "green", "Best guess": "orange"},
+                    combine_adjacent=False,
+                    color_map={"Relevant": "#ffd54f", "Best guess": "#90caf9"},
                 )
 
-        analyze_btn.click(
-            fn=run_analysis,
-            inputs=[pdf_input, profile_box, top_k_slider, threshold_slider, user_id],
-            outputs=[summary_out, highlight_out],
+        run_button.click(
+            fn=analyze_pdf,
+            inputs=[profile_input, pdf_input, top_k_input, threshold_input],
+            outputs=[summary_output, highlights_output],
         )
 
     return demo
 
 
-demo = create_app()
+print("===== Application Startup =====", flush=True)
+demo = build_demo()
 
 if __name__ == "__main__":
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", 7860)),
-        share=False,
-        show_error=True,
-    )
+    print("Launching Gradio app...", flush=True)
+    demo.launch()
