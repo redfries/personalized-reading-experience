@@ -1,0 +1,144 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+
+packages:
+  - git
+  - python3-pip
+  - python3-venv
+  - nginx
+  - ufw
+  - tmux
+
+write_files:
+  - path: /root/setup-reading-app.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      APP_REPO="__APP_REPO__"
+      APP_BRANCH="__APP_BRANCH__"
+      EMBEDDING_MODEL_NAME="__EMBEDDING_MODEL_NAME__"
+      VOLUME_NAME="__VOLUME_NAME__"
+
+      APP_DIR="/opt/personalized-reading-experience"
+      DATA_DIR="/mnt/reading-data"
+      RUNTIME_DIR="${DATA_DIR}/runtime"
+      HF_CACHE_DIR="${DATA_DIR}/hf_cache"
+      LOG_FILE="/root/setup-reading-app.log"
+
+      echo "[1/10] Checking GPU..."
+      nvidia-smi || true
+
+      echo "[2/10] Finding attached volume..."
+      mkdir -p "${DATA_DIR}"
+      VOLUME_DEVICE="/dev/disk/by-id/scsi-0DO_Volume_${VOLUME_NAME}"
+
+      if [ ! -e "${VOLUME_DEVICE}" ]; then
+        echo "Expected volume device not found: ${VOLUME_DEVICE}"
+        echo "Available DigitalOcean volume devices:"
+        ls -la /dev/disk/by-id/ | grep DO_Volume || true
+        exit 1
+      fi
+
+      echo "[3/10] Preparing volume..."
+      if ! blkid "${VOLUME_DEVICE}" >/dev/null 2>&1; then
+        echo "Formatting new volume as ext4..."
+        mkfs.ext4 -F "${VOLUME_DEVICE}"
+      else
+        echo "Volume already formatted. Keeping existing data."
+      fi
+
+      echo "[4/10] Mounting volume..."
+      if ! grep -q "${DATA_DIR}" /etc/fstab; then
+        echo "${VOLUME_DEVICE} ${DATA_DIR} ext4 defaults,nofail,discard 0 0" >> /etc/fstab
+      fi
+      mount -a
+      mkdir -p "${RUNTIME_DIR}" "${HF_CACHE_DIR}"
+
+      echo "[5/10] Cloning or updating app..."
+      if [ ! -d "${APP_DIR}/.git" ]; then
+        git clone "${APP_REPO}" "${APP_DIR}"
+      fi
+      cd "${APP_DIR}"
+      git fetch origin
+      git checkout "${APP_BRANCH}"
+      git pull origin "${APP_BRANCH}"
+
+      echo "[6/10] Creating Python virtual environment and installing requirements..."
+      python3 -m venv .venv
+      source .venv/bin/activate
+      pip install --upgrade pip
+      pip install -r requirements.txt
+
+      echo "[7/10] Creating systemd service..."
+      cat >/etc/systemd/system/reading-app.service <<SERVICEEOF
+[Unit]
+Description=Personalized Reading Assistant Gradio App
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=${APP_DIR}
+Environment=GRADIO_SERVER_NAME=0.0.0.0
+Environment=GRADIO_SERVER_PORT=7860
+Environment=EMBEDDING_DEVICE=cuda
+Environment=EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME}
+Environment=APP_RUNTIME_DIR=${RUNTIME_DIR}
+Environment=HF_HOME=${HF_CACHE_DIR}
+Environment=TRANSFORMERS_CACHE=${HF_CACHE_DIR}
+Environment=SENTENCE_TRANSFORMERS_HOME=${HF_CACHE_DIR}
+ExecStart=${APP_DIR}/.venv/bin/python ${APP_DIR}/app.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+
+      echo "[8/10] Configuring nginx reverse proxy..."
+      cat >/etc/nginx/sites-available/reading-app <<'NGINXEOF'
+server {
+    listen 80;
+    server_name _;
+
+    client_max_body_size 300M;
+
+    location / {
+        proxy_pass http://127.0.0.1:7860;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_read_timeout 900s;
+        proxy_send_timeout 900s;
+    }
+}
+NGINXEOF
+
+      ln -sf /etc/nginx/sites-available/reading-app /etc/nginx/sites-enabled/reading-app
+      rm -f /etc/nginx/sites-enabled/default
+      nginx -t
+      systemctl restart nginx
+
+      echo "[9/10] Configuring firewall..."
+      ufw allow OpenSSH
+      ufw allow 80
+      ufw --force enable
+
+      echo "[10/10] Starting app service..."
+      systemctl daemon-reload
+      systemctl enable reading-app
+      systemctl restart reading-app
+
+      echo "Setup complete. App service started."
+
+runcmd:
+  - /root/setup-reading-app.sh > /root/setup-reading-app.log 2>&1
