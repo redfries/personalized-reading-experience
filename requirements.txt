@@ -1,5 +1,5 @@
 gradio
-sentence-transformers>=2.7.0
+sentence-transformers>=3.0.0
 transformers>=4.51.0
 accelerate
 torch
