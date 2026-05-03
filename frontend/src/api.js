@@ -1,11 +1,5 @@
 const API_BASE = import.meta.env.VITE_API_BASE || "";
 
-export async function fetchMockAnalysis() {
-  const response = await fetch(`${API_BASE}/api/mock-analysis`);
-  if (!response.ok) throw new Error("Failed to fetch mock analysis");
-  return response.json();
-}
-
 export async function fetchProfiles() {
   const response = await fetch(`${API_BASE}/api/profiles`);
   if (!response.ok) throw new Error("Failed to fetch profiles");

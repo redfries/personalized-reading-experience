@@ -60,5 +60,19 @@ SAMPLE_ANALYSIS = {
         "pdf_matches": 3,
         "top_sections": ["Related Work", "Introduction", "Methodology"]
     },
+    "llm_note": {
+        "enabled": False,
+        "status": "disabled",
+        "title": "AI relevance note",
+        "overall_match": "Not generated",
+        "summary": "AI relevance note is disabled until Gemini is configured.",
+        "why_relevant": [],
+        "weak_or_missing_connections": [],
+        "reading_advice": "Run a real analysis after setting GEMINI_API_KEY to generate this note.",
+        "sections_to_focus": [],
+        "bridge_points": [],
+        "caution": "No Gemini note was generated.",
+        "provider": "gemini"
+    },
     "highlights": SAMPLE_HIGHLIGHTS
 }

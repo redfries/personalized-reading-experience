@@ -15,6 +15,13 @@ from .profile_engine import list_profiles, load_profile, preview_profile, save_p
 from .sample_data import SAMPLE_ANALYSIS
 
 ROOT = Path(__file__).resolve().parents[1]
+try:
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / ".env.local")
+    load_dotenv(ROOT / ".env")
+except Exception:
+    pass
+
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 
 RUNTIME_DIR = Path(os.environ.get("APP_RUNTIME_DIR", str(ROOT / "v4_runtime")))
@@ -26,7 +33,7 @@ TEMP_DIR = RUNTIME_DIR / "tmp"
 for folder in [PROFILES_DIR, ANALYSES_DIR, UPLOADS_DIR, TEMP_DIR]:
     folder.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Personalized Reading Assistant v4.2.1")
+app = FastAPI(title="Personalized Reading Assistant v4.3.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,7 +74,7 @@ async def save_target_pdf(upload: UploadFile) -> Path:
 def health():
     return {
         "status": "ok",
-        "app": "personalized-reading-assistant-v4.2.1",
+        "app": "personalized-reading-assistant-v4.3.5",
         "runtime_dir": str(RUNTIME_DIR),
     }
 
@@ -136,11 +143,16 @@ async def api_analyze(
     paper: UploadFile | None = File(default=None),
 ):
     if not profile_id:
-        mock = dict(SAMPLE_ANALYSIS)
-        mock["profile_name"] = profile_name
-        mock["summary"] = dict(mock["summary"])
-        mock["summary"]["density"] = density
-        return mock
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Please select a saved profile before analyzing."},
+        )
+
+    if paper is None or not paper.filename:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Please upload a target PDF before analyzing."},
+        )
 
     try:
         profile = load_profile(profile_id, PROFILES_DIR)
